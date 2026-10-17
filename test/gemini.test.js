@@ -18,6 +18,7 @@ import { discoverGeminiApiCredentials, runGeminiChat, isOtherVendorKey, foldConv
 import { geminiStatus } from '../lib/gemini/status.js';
 import { isAbortError } from '../lib/common/abort.js';
 import { CompletionWriter } from '../lib/common/completion.js';
+import { hasSqlite, ID, SAFETY_ERROR, LAST_TEXT } from './fixtures/agy-trajectory.mjs';
 
 // ── Fake agy ──
 
@@ -41,6 +42,7 @@ if (args[0] === 'models') {
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const prompt = readFileSync(0, 'utf8');
 const scenario = env.FAKE_AGY_SCENARIO || 'ok';
+const conversation = env.FAKE_AGY_CONVERSATION || 'c';
 const log = opt('--log-file');
 const agent = opt('--agent');
 const FALLBACK_LOG = 'W session.go:94] Agent "' + agent + '" not found, falling back to default\nI conversation_manager.go:512] Starting new conversation (agent=false)\n';
@@ -55,12 +57,31 @@ if (env.FAKE_AGY_DUMP) {
     writeFileSync(env.FAKE_AGY_DUMP, JSON.stringify({ pid: process.pid, args, prompt, agentMd, cwd: process.cwd(), envKeys: Object.keys(env).map((k) => k.toUpperCase()) }));
 }
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
-const step = (i, o) => out({ event: 'step_update', step_update: { conversation_id: 'c', step_index: i, ...o } });
+const step = (i, o) => out({ event: 'step_update', step_update: { conversation_id: conversation, step_index: i, ...o } });
 const usage = { input_tokens: 11, output_tokens: 5, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 16 };
-out({ event: 'init', conversation_id: 'c', init: { model: opt('--model'), agent: opt('--agent'), tools: ['run_command', 'view_file'] } });
+out({ event: 'init', conversation_id: conversation, init: { model: opt('--model'), agent: opt('--agent'), tools: ['run_command', 'view_file'] } });
 step(0, { state: 'DONE', step_type: 'user_input' });
 const hang = () => setInterval(() => {}, 1000);
 switch (scenario) {
+case 'verified-error': case 'verified-aggregate': case 'verified-blocked':
+case 'verified-missing-db': case 'verified-global-error': case 'verified-mismatch': {
+    const { writeFixture, SAFETY_ERROR, FIRST_TEXT, LAST_TEXT } = await import(env.FAKE_AGY_FIXTURE_MODULE);
+    if (scenario !== 'verified-missing-db') {
+        writeFixture(join(env.USERPROFILE, '.gemini', 'antigravity-cli', 'conversations'), {
+            id: conversation, stopReason: scenario === 'verified-blocked' ? 11 : 2,
+        });
+    }
+    step(1, { state: 'DONE', step_type: 'agent_response', text_delta: FIRST_TEXT });
+    step(2, { state: 'DONE', step_type: 'error_message' });
+    step(3, { state: 'ACTIVE', step_type: 'agent_response', text_delta: LAST_TEXT });
+    await new Promise((r) => setTimeout(r, 100));
+    step(3, { state: 'DONE', step_type: 'agent_response', ...(scenario === 'verified-mismatch' ? { conversation_id: 'different-conversation' } : {}) });
+    if (scenario === 'verified-global-error') process.stderr.write('AGY_ERROR: {"error_code":503,"code_kind":"http","status":"UNAVAILABLE"}\n');
+    writeFileSync(env.FAKE_AGY_FINAL_MARKER, 'done');
+    out({ event: 'result', result: { status: scenario === 'verified-aggregate' ? 'SUCCESS' : 'ERROR',
+        response: FIRST_TEXT + '\n\n' + LAST_TEXT, error: scenario === 'verified-aggregate' ? undefined : SAFETY_ERROR, usage } });
+    break;
+}
 case 'fallback-late':
     appendFileSync(log, FALLBACK_LOG);
     // fall through
@@ -205,6 +226,9 @@ const fakeAgy = join(dir, 'agy.mjs');
 writeFileSync(fakeAgy, FAKE_AGY);
 const oldAgy = join(dir, 'agy-old.mjs');
 copyFileSync(fakeAgy, oldAgy);
+const verifiedAgy = join(dir, 'agy-141.mjs');
+copyFileSync(fakeAgy, verifiedAgy);
+const finalMarker = join(dir, 'final-marker');
 const dumpFile = join(dir, 'dump.json');
 const countFile = join(dir, 'count.txt');
 const home = join(dir, 'home');
@@ -224,6 +248,17 @@ function resetEnv(extra = {}) {
     process.env.FAKE_AGY_DUMP = dumpFile;
     Object.assign(process.env, extra);
     rmSync(dumpFile, { force: true });
+    rmSync(finalMarker, { force: true });
+}
+function verifiedEnv(scenario, extra = {}) {
+    resetEnv({
+        FAKE_AGY_SCENARIO: scenario, FAKE_AGY_VERSION: '1.4.1',
+        ST_SUBSCRIPTIONS_AGY_PATH: verifiedAgy, FAKE_AGY_CONVERSATION: ID,
+        FAKE_AGY_FIXTURE_MODULE: new URL('./fixtures/agy-trajectory.mjs', import.meta.url).href,
+        FAKE_AGY_FINAL_MARKER: finalMarker, ST_SUBSCRIPTIONS_AGY_RETRY_CHECK_MS: '100',
+        ...extra,
+    });
+    rmSync(join(home, '.gemini', 'antigravity-cli', 'conversations', ID + '.db'), { force: true });
 }
 function setSettings(obj) {
     if (obj) writeFileSync(settingsFile, JSON.stringify(obj)); else rmSync(settingsFile, { force: true });
@@ -460,7 +495,92 @@ test('runAgy: final SUCCESS completes even when agy or inherited stdout stays op
     }
 });
 
-test('runAgy runs the isolated agent with a scrubbed env and streams text', async () => {
+test('runAgy: stale ERROR and aggregate SUCCESS deliver only the independently verified retry', { skip: !hasSqlite }, async () => {
+    for (const scenario of ['verified-error', 'verified-aggregate']) {
+        verifiedEnv(scenario);
+        const parts = [];
+        const result = await runAgy({ prompt: 'p', model: 'm', onText: (text) => {
+            assert.ok(existsSync(finalMarker), 'no body may be sent before the terminal result');
+            parts.push(text);
+            return false;
+        } });
+        assert.equal(result.status, 'SUCCESS');
+        assert.equal(result.response, LAST_TEXT);
+        assert.deepEqual(parts, [LAST_TEXT], 'the rejected first draft and aggregate snapshot must never be emitted');
+        assert.ok(await waitGone(dump().pid));
+    }
+});
+
+test('runAgy: unverifiable retries and new global errors fail without emitting buffered drafts', { skip: !hasSqlite }, async () => {
+    for (const [scenario, code] of [
+        ['verified-blocked', 422], ['verified-missing-db', 422],
+        ['verified-global-error', 503], ['verified-mismatch', 502],
+    ]) {
+        verifiedEnv(scenario);
+        let emitted = '';
+        await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { emitted += d; return false; } }),
+            (err) => err.httpStatus === code && (code !== 422 || err.partialResponse === undefined), scenario);
+        assert.equal(emitted, '');
+        assert.ok(await waitGone(dump().pid));
+    }
+});
+
+test('runAgy: abort during terminal verification discards all buffered text', { skip: !hasSqlite }, async () => {
+    verifiedEnv('verified-error');
+    const controller = new AbortController();
+    let emitted = '';
+    const pending = runAgy({ prompt: 'p', model: 'm', signal: controller.signal, onText: (d) => { emitted += d; return false; } });
+    for (let i = 0; i < 100 && !existsSync(finalMarker); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(existsSync(finalMarker));
+    controller.abort();
+    await assert.rejects(pending, isAbortError);
+    assert.equal(emitted, '');
+    assert.ok(await waitGone(dump().pid));
+});
+
+test('runGeminiChat: JSON and live SSE heartbeat deliver the verified retry exactly once', { skip: !hasSqlite }, async () => {
+    const server = http.createServer(async (req, res) => {
+        const controller = new AbortController();
+        res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+        const writer = new CompletionWriter({ res, stream: req.url === '/stream', model: 'gemini-3.8-flash-low' });
+        if (writer.stream) writer.startHeartbeat(15);
+        await runGeminiChat({ req: null, messages: convo, model: 'gemini-3.8-flash-low', settings: baseSettings(), writer, signal: controller.signal });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const url = 'http://127.0.0.1:' + server.address().port;
+    try {
+        verifiedEnv('verified-error');
+        const response = await fetch(url);
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).choices[0].message.content, LAST_TEXT);
+        assert.ok(await waitGone(dump().pid));
+
+        verifiedEnv('verified-error');
+        const stream = await fetch(url + '/stream');
+        const reader = stream.body.getReader();
+        const first = await reader.read();
+        assert.ok(!new TextDecoder().decode(first.value).includes(LAST_TEXT), 'connection opens before body is verified');
+        const packets = [first.value];
+        for (;;) {
+            const next = await reader.read();
+            if (next.done) break;
+            packets.push(next.value);
+        }
+        const sse = Buffer.concat(packets).toString('utf8');
+        const events = sse.split('\n').filter((s) => s.startsWith('data: {')).map((s) => JSON.parse(s.slice(6)));
+        assert.match(sse, /: keep-alive/);
+        assert.equal(events.map((e) => e.choices?.[0]?.delta?.content ?? '').join(''), LAST_TEXT);
+        assert.ok(events.every((e) => !e.error));
+        assert.ok(events.some((e) => e.choices?.[0]?.finish_reason === 'stop'));
+        assert.match(sse, /data: \[DONE\]/);
+        assert.ok(await waitGone(dump().pid));
+    } finally {
+        server.closeAllConnections();
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('runAgy runs the isolated agent with a scrubbed env and delivers verified text', async () => {
     resetEnv({ ANTHROPIC_API_KEY: 'sk-ant-leak', GEMINI_API_KEY: 'gk', GOOGLE_GEMINI_BASE_URL: 'https://relay.example', GITHUB_TOKEN: 'gh' });
     let text = '';
     const r = await runAgy({ prompt: 'PROMPT-BODY', model: 'gemini-3.8-flash-high', onText: (d) => { text += d; return false; } });
@@ -514,15 +634,15 @@ test('runAgy: non-zero exit after partial text is an error with the mapped statu
     resetEnv({ FAKE_AGY_SCENARIO: 'partial-exit3' });
     let text = '';
     await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } }), (err) => err.httpStatus === 503 && /partial output/.test(err.message));
-    assert.equal(text, 'Half a sent');
+    assert.equal(text, '', 'partial generation is not emitted as a successful stream');
 });
 
 test('runAgy: an unfinished retry times out without duplicating streamed text', async () => {
     resetEnv({ FAKE_AGY_SCENARIO: 'midstream' });
     let text = '';
     await assert.rejects(runAgy({ prompt: 'p', model: 'm', idleMs: 400, onText: (d) => { text += d; return false; } }),
-        (err) => err.httpStatus === 504 && err.partialResponse === 'Part\n');
-    assert.equal(text, 'Part\n');
+        (err) => err.httpStatus === 504 && err.partialResponse === 'Part');
+    assert.equal(text, '', 'nothing from either unfinished attempt reaches the client');
     assert.ok(await waitGone(dump().pid));
 });
 
@@ -562,7 +682,7 @@ test('runAgy: post-error text is buffered pending a final result, including reus
         let text = '';
         await assert.rejects(runAgy({ prompt: 'p', model: 'm', idleMs: 400, finalResultMs: 400, onText: (d) => { text += d; return false; } }),
             (err) => err.httpStatus === 504, scenario);
-        assert.equal(text, 'Hello', 'no text from a retry reaches the client');
+        assert.equal(text, '', 'no unverified attempt reaches the client');
         assert.ok(await waitGone(dump().pid));
     }
 });
@@ -574,7 +694,7 @@ test('runAgy: waiting for a post-text final result remains bounded by the idle w
     assert.ok(await waitGone(dump().pid));
 });
 
-test('runAgy: same-step continuation and prefix-compatible retries emit each character once', async () => {
+test('runAgy: same-step continuation and completed retries deliver one final answer', async () => {
     for (const [scenario, expected] of [['same-step-continue', 'Hello'], ['retry-success', 'Hello again'], ['empty-recovery', 'Recovered']]) {
         resetEnv({ FAKE_AGY_SCENARIO: scenario });
         let text = '';
@@ -584,16 +704,11 @@ test('runAgy: same-step continuation and prefix-compatible retries emit each cha
     }
 });
 
-test('runAgy: divergent retry replaces a buffered JSON answer but cannot rewrite streamed text', async () => {
+test('runAgy: divergent retry is selected before JSON or SSE text is emitted', async () => {
     resetEnv({ FAKE_AGY_SCENARIO: 'retry-divergent' });
     let text = '';
-    await runAgy({ prompt: 'p', model: 'm', stream: false, onText: (d) => { text += d; return false; } });
+    await runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } });
     assert.equal(text, 'Changed answer');
-    resetEnv({ FAKE_AGY_SCENARIO: 'retry-divergent' });
-    text = '';
-    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } }),
-        (err) => err.httpStatus === 502 && err.noRetry && err.partialResponse === 'Hel' && /differs/.test(err.message));
-    assert.equal(text, 'Hel');
 });
 
 test('runAgy: DONE alone and repeated background status cannot extend the final-result deadline', async () => {
@@ -615,7 +730,7 @@ test('runAgy: explicit final errors drain stderr briefly without waiting for a h
 });
 
 test('runAgy: stop callbacks and whole-turn deadlines still terminate generation', async () => {
-    resetEnv({ FAKE_AGY_SCENARIO: 'done-no-result' });
+    resetEnv({ FAKE_AGY_SCENARIO: 'ok' });
     const stopped = await runAgy({ prompt: 'p', model: 'm', onText: () => true });
     assert.equal(stopped.response, 'Hello');
     assert.ok(await waitGone(dump().pid));
@@ -655,10 +770,10 @@ test('runGeminiChat: final success reaches JSON and SSE before the agy process e
         assert.equal(replaced.status, 200);
         assert.equal((await replaced.json()).choices[0].message.content, 'Changed answer');
         const divergentStream = await fetch(`${base}/stream`);
-        const errorSse = await divergentStream.text();
-        assert.match(errorSse, /"incomplete":true/);
-        assert.match(errorSse, /"partial_response":\{"content":"Hel"/);
-        assert.ok(!errorSse.includes('"finish_reason":"stop"'));
+        const retrySse = await divergentStream.text();
+        const retryChunks = retrySse.split('\n').filter((line) => line.startsWith('data: {')).map((line) => JSON.parse(line.slice(6)));
+        assert.equal(retryChunks.map((c) => c.choices?.[0]?.delta?.content ?? '').join(''), 'Changed answer');
+        assert.ok(retryChunks.every((c) => !c.error));
     } finally {
         server.closeAllConnections();
         await new Promise((resolve) => server.close(resolve));

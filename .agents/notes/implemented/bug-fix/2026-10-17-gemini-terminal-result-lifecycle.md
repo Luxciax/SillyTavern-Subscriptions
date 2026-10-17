@@ -2,6 +2,10 @@
 
 Status: implemented
 
+The immediate-streaming and terminal-error decisions are partially superseded by
+[verified retry delivery](2026-10-18-gemini-verified-retry.md).
+The terminal-result/process-cleanup separation remains in force.
+
 ## Problem
 
 The previous runner records result.SUCCESS but waits for child close before
