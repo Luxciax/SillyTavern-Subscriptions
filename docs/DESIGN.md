@@ -196,6 +196,15 @@ plugin, so a key is only ever billed after the user opts in (Auto or API).
   the host's local time to each turn.
 * agy never streams thoughts in stream-json mode; reasoning display only
   works on the `api` backend. Images are not supported on the agy path.
+* An `error_message` after response text is not by itself a terminal failure.
+  The runner waits for the final result and process exit. It accepts the text
+  only when the last text-bearing step is `DONE`, the final result is
+  `SUCCESS`, the process exits cleanly, and no structured CLI error is reported.
+  New response text after the error (even with a reused step index), or a new
+  active response step, stops the turn before restarted text reaches the client.
+  Missing completion, final errors, refusals and timeouts remain failures.
+  Status-only `DONE` updates for the original response are harmless. Existing
+  watchdogs bound the wait; event metadata is logged without response text.
 
 ## HTTP layer
 
