@@ -188,23 +188,35 @@ plugin, so a key is only ever billed after the user opts in (Auto or API).
   `--disable-slash-commands`. agy silently falls back to its default agent for
   an unknown `--agent`, so each run writes its own log and the turn is killed
   if the log shows the fallback. Any tool step kills the process tree.
-* agy re-asks a safety-blocked prompt once, in-process, before the plugin
-  can stop it (no switch for that in 1.2.14); the runner then kills the turn
-  and returns a 422 refusal — nothing from the retry reaches the client. Use
-  the API backend when a strict wire-level no-retry matters. Persistent 429s
+* agy can retry a failed/blocked prompt internally (no switch for that in
+  1.2.14). An empty response plus an intermediate error does not establish
+  a refusal. Explicit final safety errors map to 422; the plugin adds no
+  provider retry or fallback. Use the API backend when strict wire-level
+  no-retry matters. Persistent 429s
   end the turn after ~11 s instead of waiting for the watchdog. agy also adds
   the host's local time to each turn.
 * agy never streams thoughts in stream-json mode; reasoning display only
   works on the `api` backend. Images are not supported on the agy path.
-* An `error_message` after response text is not by itself a terminal failure.
-  The runner waits for the final result and process exit. It accepts the text
-  only when the last text-bearing step is `DONE`, the final result is
-  `SUCCESS`, the process exits cleanly, and no structured CLI error is reported.
-  New response text after the error (even with a reused step index), or a new
-  active response step, stops the turn before restarted text reaches the client.
-  Missing completion, final errors, refusals and timeouts remain failures.
-  Status-only `DONE` updates for the original response are harmless. Existing
-  watchdogs bound the wait; event metadata is logged without response text.
+* A terminal `result.SUCCESS` with a nonempty, unambiguous response completes
+  the request immediately. A preceding `DONE` or clean process exit is not
+  required; cleanup receives a separate 2 s grace period and cannot change the
+  completed HTTP result. Late shutdown errors are not generation failures.
+  Final errors allow a bounded 200 ms stderr drain for status mapping.
+* An intermediate `error_message` is diagnostic. Subsequent response text is
+  buffered, including reused indices. JSON requests emit only the final answer.
+  SSE requests reconcile the final snapshot with text already sent: only an exact
+  prefix permits emitting the remaining suffix; divergence fails explicitly
+  instead of appending a restarted answer. Ambiguous retries without a final
+  response snapshot fail. No semantic deduplication or automatic retry is added.
+* Waits remain bounded: first text 240 s, generation idle 120 s, response-DONE to
+  terminal result 120 s, whole turn 600 s. The corresponding env overrides are
+  `ST_SUBSCRIPTIONS_AGY_FIRST_OUTPUT_MS`, `ST_SUBSCRIPTIONS_AGY_IDLE_MS`,
+  `ST_SUBSCRIPTIONS_AGY_FINAL_RESULT_MS` and `ST_SUBSCRIPTIONS_AGY_TIMEOUT_MS`;
+  cleanup uses `ST_SUBSCRIPTIONS_AGY_CLEANUP_MS`. Stderr and repeated status-only
+  updates never reset progress timers. `DONE` or a zero exit without a terminal
+  result is not success. Failure logs include a bounded metadata-only event trace.
+  Errors with partial text expose `partial_response: {content, incomplete: true}`
+  in JSON/SSE error payloads; existing Tavern UIs may only display the error.
 
 ## HTTP layer
 

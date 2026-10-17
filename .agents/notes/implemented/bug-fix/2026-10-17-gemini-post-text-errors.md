@@ -2,6 +2,10 @@
 
 Status: implemented
 
+The final-outcome/cleanup and retry decisions are partially superseded by
+[terminal-result lifecycle](2026-10-17-gemini-terminal-result-lifecycle.md).
+The original error-event attribution finding and isolation boundary still apply.
+
 ## Problem
 
 The Gemini runner kills agy whenever an `error_message` follows any response text.

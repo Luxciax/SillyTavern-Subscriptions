@@ -22,6 +22,7 @@ import { CompletionWriter } from '../lib/common/completion.js';
 // ── Fake agy ──
 
 const FAKE_AGY = String.raw`
+import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
@@ -123,7 +124,50 @@ case 'posttext-retry-new-step':
 case 'refusal':
     step(1, { state: 'DONE', step_type: 'agent_response', usage: { ...usage, output_tokens: 0 } });
     step(2, { state: 'DONE', step_type: 'error_message' });
+    out({ event: 'result', result: { status: 'ERROR', error: 'blocked by content safety filter' } });
+    break;
+case 'success-hang': case 'success-pipes':
+    step(1, { state: 'DONE', step_type: 'agent_response', text_delta: 'Hello', usage });
+    out({ event: 'result', result: { status: 'SUCCESS', response: 'Hello', usage } });
+    if (scenario === 'success-pipes') {
+        const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 2500)'], { stdio: ['ignore', 1, 2], windowsHide: true });
+        child.unref();
+    } else hang();
+    break;
+case 'empty-recovery':
+    step(1, { state: 'DONE', step_type: 'agent_response' });
+    step(2, { state: 'DONE', step_type: 'error_message' });
+    step(3, { state: 'DONE', step_type: 'agent_response', text_delta: 'Recovered' });
+    out({ event: 'result', result: { status: 'SUCCESS', response: 'Recovered', usage } });
+    break;
+case 'final-error-hang':
+    out({ event: 'result', result: { status: 'ERROR', error: 'upstream unavailable' } });
+    setTimeout(() => process.stderr.write('AGY_ERROR: {"error_code":503,"code_kind":"http","status":"UNAVAILABLE"}\n'), 50);
     hang();
+    break;
+case 'progress':
+    setInterval(() => step(1, { state: 'ACTIVE', step_type: 'agent_response', text_delta: 'x' }), 30);
+    break;
+case 'retry-success': case 'retry-divergent':
+    step(1, { state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hel' });
+    step(2, { state: 'DONE', step_type: 'error_message' });
+    step(3, { state: 'ACTIVE', step_type: 'agent_response', text_delta: scenario === 'retry-success' ? 'Hello again' : 'Changed answer' });
+    step(3, { state: 'DONE', step_type: 'agent_response' });
+    out({ event: 'result', result: { status: 'SUCCESS', response: scenario === 'retry-success' ? 'Hello again' : 'Changed answer', usage } });
+    break;
+case 'same-step-continue':
+    step(1, { state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Hel' });
+    step(2, { state: 'DONE', step_type: 'error_message' });
+    step(1, { state: 'DONE', step_type: 'agent_response', text_delta: 'lo' });
+    out({ event: 'result', result: { status: 'SUCCESS', response: 'Hello', usage } });
+    break;
+case 'done-no-result': case 'noise':
+    step(1, { state: 'DONE', step_type: 'agent_response', text_delta: 'Hello' });
+    if (scenario === 'noise') setInterval(() => {
+        process.stderr.write('background status: alive\n');
+        step(1, { state: 'DONE', step_type: 'agent_response' });
+    }, 40);
+    else hang();
     break;
 case 'hang':
     hang();
@@ -404,6 +448,18 @@ test('model catalog: failure backoff, deduplicated refresh, no downgrade', async
 
 const noText = () => false;
 
+test('runAgy: final SUCCESS completes even when agy or inherited stdout stays open', async () => {
+    for (const scenario of ['success-hang', 'success-pipes']) {
+        resetEnv({ FAKE_AGY_SCENARIO: scenario });
+        let text = '';
+        const r = await runAgy({ prompt: 'p', model: 'm', idleMs: 400, cleanupMs: 150,
+            onText: (d) => { text += d; return false; } });
+        assert.equal(r.status, 'SUCCESS', scenario);
+        assert.equal(text, 'Hello', scenario);
+        assert.ok(await waitGone(dump().pid), 'a stuck primary process is cleaned up after returning the answer');
+    }
+});
+
 test('runAgy runs the isolated agent with a scrubbed env and streams text', async () => {
     resetEnv({ ANTHROPIC_API_KEY: 'sk-ant-leak', GEMINI_API_KEY: 'gk', GOOGLE_GEMINI_BASE_URL: 'https://relay.example', GITHUB_TOKEN: 'gh' });
     let text = '';
@@ -424,7 +480,10 @@ test('runAgy runs the isolated agent with a scrubbed env and streams text', asyn
     assert.ok(existsSync(join(d.cwd, '.agents', 'agents', CHAT_AGENT_NAME, 'agent.md')));
     for (const k of ['ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GITHUB_TOKEN']) assert.ok(!d.envKeys.includes(k), `${k} must not reach agy on the subscription path`);
     assert.ok(d.envKeys.includes('PATH'));
-    assert.equal(existsSync(flag('--log-file')), false, 'the per-run log is removed after a clean run');
+    assert.ok(await waitGone(d.pid));
+    // HTTP success no longer waits for the process close/cleanup callback.
+    for (let i = 0; i < 40 && existsSync(flag('--log-file')); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(existsSync(flag('--log-file')), false, 'the per-run log is removed after cleanup');
 
     await runAgy({ prompt: 'p', model: 'gemini-3.1-pro', effort: 'low', allowApiKey: true, onText: noText });
     const k = dump();
@@ -458,10 +517,11 @@ test('runAgy: non-zero exit after partial text is an error with the mapped statu
     assert.equal(text, 'Half a sent');
 });
 
-test('runAgy: a mid-stream restart is an error, not duplicated text', async () => {
+test('runAgy: an unfinished retry times out without duplicating streamed text', async () => {
     resetEnv({ FAKE_AGY_SCENARIO: 'midstream' });
     let text = '';
-    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } }), (err) => err.httpStatus === 502 && /interrupted/.test(err.message));
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', idleMs: 400, onText: (d) => { text += d; return false; } }),
+        (err) => err.httpStatus === 504 && err.partialResponse === 'Part\n');
     assert.equal(text, 'Part\n');
     assert.ok(await waitGone(dump().pid));
 });
@@ -478,28 +538,30 @@ test('runAgy: a completed response followed by an error event waits for final SU
     }
 });
 
-test('runAgy: text after an error cannot be reported as success without DONE and final SUCCESS', async () => {
-    for (const scenario of ['posttext-exit0', 'posttext-incomplete']) {
+test('runAgy: final SUCCESS is required, but an intermediate DONE is not', async () => {
+    resetEnv({ FAKE_AGY_SCENARIO: 'posttext-exit0' });
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText }),
+        (err) => err.httpStatus === 502 && /without a final SUCCESS/.test(err.message));
+    for (const scenario of ['posttext-incomplete', 'posttext-stderr-error']) {
         resetEnv({ FAKE_AGY_SCENARIO: scenario });
-        await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText }),
-            (err) => err.httpStatus === 502 && /completed response.*SUCCESS/i.test(err.message), scenario);
+        assert.equal((await runAgy({ prompt: 'p', model: 'm', onText: noText })).status, 'SUCCESS');
     }
 });
 
 test('runAgy: final failures and explicit safety errors remain failures after completed text', async () => {
-    for (const [scenario, status] of [['posttext-final-error', 503], ['posttext-stderr-error', 503], ['posttext-safety', 422]]) {
+    for (const [scenario, status] of [['posttext-final-error', 503], ['posttext-safety', 422]]) {
         resetEnv({ FAKE_AGY_SCENARIO: scenario });
         await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText }),
             (err) => err.httpStatus === status && (status !== 422 || (err.refusal && err.noRetry)), scenario);
     }
 });
 
-test('runAgy: post-error retries are stopped before text, including reused step indices', async () => {
+test('runAgy: post-error text is buffered pending a final result, including reused indices', async () => {
     for (const scenario of ['posttext-retry-same-step', 'posttext-retry-new-step']) {
         resetEnv({ FAKE_AGY_SCENARIO: scenario });
         let text = '';
-        await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } }),
-            (err) => err.httpStatus === 502 && /restart|another response/i.test(err.message), scenario);
+        await assert.rejects(runAgy({ prompt: 'p', model: 'm', idleMs: 400, finalResultMs: 400, onText: (d) => { text += d; return false; } }),
+            (err) => err.httpStatus === 504, scenario);
         assert.equal(text, 'Hello', 'no text from a retry reaches the client');
         assert.ok(await waitGone(dump().pid));
     }
@@ -507,13 +569,64 @@ test('runAgy: post-error retries are stopped before text, including reused step 
 
 test('runAgy: waiting for a post-text final result remains bounded by the idle watchdog', async () => {
     resetEnv({ FAKE_AGY_SCENARIO: 'posttext-hang' });
-    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText, idleMs: 400 }),
-        (err) => err.httpStatus === 504 && /stopped streaming/.test(err.message));
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText, finalResultMs: 400 }),
+        (err) => err.httpStatus === 504 && /no final result/.test(err.message));
     assert.ok(await waitGone(dump().pid));
 });
 
-test('runGeminiChat: a completed response with a later error reaches JSON and SSE clients', async () => {
-    resetEnv({ FAKE_AGY_SCENARIO: 'posttext-success' });
+test('runAgy: same-step continuation and prefix-compatible retries emit each character once', async () => {
+    for (const [scenario, expected] of [['same-step-continue', 'Hello'], ['retry-success', 'Hello again'], ['empty-recovery', 'Recovered']]) {
+        resetEnv({ FAKE_AGY_SCENARIO: scenario });
+        let text = '';
+        const r = await runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } });
+        assert.equal(text, expected, scenario);
+        assert.equal(r.response, expected, scenario);
+    }
+});
+
+test('runAgy: divergent retry replaces a buffered JSON answer but cannot rewrite streamed text', async () => {
+    resetEnv({ FAKE_AGY_SCENARIO: 'retry-divergent' });
+    let text = '';
+    await runAgy({ prompt: 'p', model: 'm', stream: false, onText: (d) => { text += d; return false; } });
+    assert.equal(text, 'Changed answer');
+    resetEnv({ FAKE_AGY_SCENARIO: 'retry-divergent' });
+    text = '';
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { text += d; return false; } }),
+        (err) => err.httpStatus === 502 && err.noRetry && err.partialResponse === 'Hel' && /differs/.test(err.message));
+    assert.equal(text, 'Hel');
+});
+
+test('runAgy: DONE alone and repeated background status cannot extend the final-result deadline', async () => {
+    for (const scenario of ['done-no-result', 'noise']) {
+        resetEnv({ FAKE_AGY_SCENARIO: scenario });
+        const start = Date.now();
+        await assert.rejects(runAgy({ prompt: 'p', model: 'm', idleMs: 400, finalResultMs: 400, timeoutMs: 3000, onText: noText }),
+            (err) => err.httpStatus === 504 && /no final result/.test(err.message));
+        assert.ok(Date.now() - start < 2500, 'background noise must not keep the request alive until the whole-turn deadline');
+        assert.ok(await waitGone(dump().pid));
+    }
+});
+
+test('runAgy: explicit final errors drain stderr briefly without waiting for a hung process', async () => {
+    resetEnv({ FAKE_AGY_SCENARIO: 'final-error-hang' });
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', firstOutputMs: 1000, onText: noText }),
+        (err) => err.httpStatus === 503 && /upstream unavailable/.test(err.message));
+    assert.ok(await waitGone(dump().pid));
+});
+
+test('runAgy: stop callbacks and whole-turn deadlines still terminate generation', async () => {
+    resetEnv({ FAKE_AGY_SCENARIO: 'done-no-result' });
+    const stopped = await runAgy({ prompt: 'p', model: 'm', onText: () => true });
+    assert.equal(stopped.response, 'Hello');
+    assert.ok(await waitGone(dump().pid));
+    resetEnv({ FAKE_AGY_SCENARIO: 'progress' });
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', timeoutMs: 400, idleMs: 300, onText: noText }),
+        (err) => err.httpStatus === 504 && /did not finish within/.test(err.message) && err.partialResponse.length > 0);
+    assert.ok(await waitGone(dump().pid));
+});
+
+test('runGeminiChat: final success reaches JSON and SSE before the agy process exits', async () => {
+    resetEnv({ FAKE_AGY_SCENARIO: 'success-hang', ST_SUBSCRIPTIONS_AGY_IDLE_MS: '400', ST_SUBSCRIPTIONS_AGY_FINAL_RESULT_MS: '400', ST_SUBSCRIPTIONS_AGY_CLEANUP_MS: '150' });
     const server = http.createServer(async (req, res) => {
         const writer = new CompletionWriter({ res, stream: req.url === '/stream', model: 'gemini-3.8-flash-low' });
         await runGeminiChat({ req: null, messages: convo, model: 'gemini-3.8-flash-low', settings: baseSettings(), writer, signal: new AbortController().signal });
@@ -526,6 +639,7 @@ test('runGeminiChat: a completed response with a later error reaches JSON and SS
         const body = await json.json();
         assert.equal(body.choices[0].message.content, 'Hello');
         assert.equal(body.choices[0].finish_reason, 'stop');
+        assert.ok(await waitGone(dump().pid));
         const stream = await fetch(`${base}/stream`);
         assert.equal(stream.status, 200);
         const sse = await stream.text();
@@ -534,13 +648,24 @@ test('runGeminiChat: a completed response with a later error reaches JSON and SS
         assert.equal(chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? '').join(''), 'Hello');
         assert.ok(chunks.some((chunk) => chunk.choices?.[0]?.finish_reason === 'stop'));
         assert.match(sse, /data: \[DONE\]/);
+        assert.ok(await waitGone(dump().pid));
+
+        resetEnv({ FAKE_AGY_SCENARIO: 'retry-divergent' });
+        const replaced = await fetch(base);
+        assert.equal(replaced.status, 200);
+        assert.equal((await replaced.json()).choices[0].message.content, 'Changed answer');
+        const divergentStream = await fetch(`${base}/stream`);
+        const errorSse = await divergentStream.text();
+        assert.match(errorSse, /"incomplete":true/);
+        assert.match(errorSse, /"partial_response":\{"content":"Hel"/);
+        assert.ok(!errorSse.includes('"finish_reason":"stop"'));
     } finally {
         server.closeAllConnections();
         await new Promise((resolve) => server.close(resolve));
     }
 });
 
-test('runAgy: an empty (blocked) reply is a refusal and agy\'s own retries are cut off', async () => {
+test('runAgy: an explicit final safety error is a refusal', async () => {
     resetEnv({ FAKE_AGY_SCENARIO: 'refusal' });
     await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText }), (err) => err.httpStatus === 422 && err.refusal === true && err.noRetry === true);
     assert.ok(await waitGone(dump().pid));
@@ -765,7 +890,10 @@ test('runGeminiChat partitions >192 KB roleplay chats across agent.md and STDIN 
     assert.equal(recentMatches[recentMatches.length - 1], 100);
     assert.deepEqual([...earlierMatches, ...recentMatches], Array.from({ length: 100 }, (_, i) => i + 1), 'every turn 1..100 appears once in strict chronological order');
 
-    assert.equal(existsSync(join(d.cwd, '.agents', 'agents', agentArg)), false, 'the per-run agent directory is cleaned up after the turn completes');
+    const agentDir = join(d.cwd, '.agents', 'agents', agentArg);
+    assert.ok(await waitGone(d.pid));
+    for (let i = 0; i < 40 && existsSync(agentDir); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(existsSync(agentDir), false, 'the per-run agent directory is removed during process cleanup');
 });
 
 test('foldConversationForAgy trims oldest history turns when a mega-conversation exceeds AGY_MAX_TOTAL_BYTES', () => {
