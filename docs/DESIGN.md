@@ -208,15 +208,17 @@ plugin, so a key is only ever billed after the user opts in (Auto or API).
   a restarted answer can replace a buffered draft before any content is sent.
   Stop strings are applied at delivery, so they no longer stop model generation
   early. Aborts and timeouts still cancel generation.
-* agy 1.4.1 can report an earlier CONTENT_FILTER error after a later normally
+* agy 1.4.1/1.4.2 can report an earlier CONTENT_FILTER error after a later normally
   stopped response. On this conflict, `lib/gemini/trajectory.js` checks only the
   exact conversation's SQLite file in read-only mode. Recovery requires the old
   error to match, a later DONE response with STOP_PATTERN, matching event text,
   and no later error/unfinished step, response tool calls or new global error.
+  Event text may have one extra framing LF emitted with DONE; other differences
+  are rejected, and delivery uses the persisted normal response.
   Only the verified retry text is delivered; filtered drafts and aggregate
   `result.response` snapshots are never used for recovery.
 * Recovery uses dynamically imported `node:sqlite` on Node 22.13+ / 24+,
-  an exact tested CLI version (1.4.1), and a bounded 1.5 s read/flush wait
+  an exact tested CLI version (1.4.1 or 1.4.2), and a bounded 1.5 s read/flush wait
   (`ST_SUBSCRIPTIONS_AGY_RETRY_CHECK_MS`, capped at 2 s). Older runtimes,
   unknown CLI versions, missing/mismatched databases and undecodable schemas
   preserve the error. A SUCCESS snapshot mixing attempts also requires this

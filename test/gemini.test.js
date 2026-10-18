@@ -75,7 +75,7 @@ case 'verified-missing-db': case 'verified-global-error': case 'verified-mismatc
     step(2, { state: 'DONE', step_type: 'error_message' });
     step(3, { state: 'ACTIVE', step_type: 'agent_response', text_delta: LAST_TEXT });
     await new Promise((r) => setTimeout(r, 100));
-    step(3, { state: 'DONE', step_type: 'agent_response', ...(scenario === 'verified-mismatch' ? { conversation_id: 'different-conversation' } : {}) });
+    step(3, { state: 'DONE', step_type: 'agent_response', ...(env.FAKE_AGY_DONE_LF ? { text_delta: '\n' } : {}), ...(scenario === 'verified-mismatch' ? { conversation_id: 'different-conversation' } : {}) });
     if (scenario === 'verified-global-error') process.stderr.write('AGY_ERROR: {"error_code":503,"code_kind":"http","status":"UNAVAILABLE"}\n');
     writeFileSync(env.FAKE_AGY_FINAL_MARKER, 'done');
     out({ event: 'result', result: { status: scenario === 'verified-aggregate' ? 'SUCCESS' : 'ERROR',
@@ -228,6 +228,8 @@ const oldAgy = join(dir, 'agy-old.mjs');
 copyFileSync(fakeAgy, oldAgy);
 const verifiedAgy = join(dir, 'agy-141.mjs');
 copyFileSync(fakeAgy, verifiedAgy);
+const verifiedAgy142 = join(dir, 'agy-142.mjs');
+copyFileSync(fakeAgy, verifiedAgy142);
 const finalMarker = join(dir, 'final-marker');
 const dumpFile = join(dir, 'dump.json');
 const countFile = join(dir, 'count.txt');
@@ -521,6 +523,22 @@ test('runAgy: unverifiable retries and new global errors fail without emitting b
         await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: (d) => { emitted += d; return false; } }),
             (err) => err.httpStatus === code && (code !== 422 || err.partialResponse === undefined), scenario);
         assert.equal(emitted, '');
+        assert.ok(await waitGone(dump().pid));
+    }
+});
+
+test('runAgy: agy 1.4.2 DONE framing LF does not discard a verified retry', { skip: !hasSqlite }, async () => {
+    for (const scenario of ['verified-error', 'verified-aggregate', 'verified-blocked']) {
+        verifiedEnv(scenario, { FAKE_AGY_VERSION: '1.4.2', ST_SUBSCRIPTIONS_AGY_PATH: verifiedAgy142, FAKE_AGY_DONE_LF: '1' });
+        let emitted = '';
+        const pending = runAgy({ prompt: 'p', model: 'm', onText: (d) => { emitted += d; return false; } });
+        if (scenario === 'verified-blocked') {
+            await assert.rejects(pending, (err) => err.httpStatus === 422 && err.partialResponse === undefined);
+            assert.equal(emitted, '');
+        } else {
+            assert.equal((await pending).response, LAST_TEXT);
+            assert.equal(emitted, LAST_TEXT);
+        }
         assert.ok(await waitGone(dump().pid));
     }
 });

@@ -39,10 +39,24 @@ test('filtering, incomplete results, new errors, unknown schemas and other conve
     }
 });
 
+test('tested CLI versions accept the exact reply or one framing LF, without trimming mismatches', { skip: !hasSqlite }, async () => {
+    writeFixture(directory);
+    for (const version of ['1.4.1', '1.4.2']) {
+        for (const suffix of ['', '\n']) {
+            const result = await verifyAgyRetry(request({ version, expectedText: LAST_TEXT + suffix }));
+            assert.equal(result.ok, true);
+            assert.equal(result.response, LAST_TEXT);
+        }
+        for (const expectedText of [LAST_TEXT + '\n\n', LAST_TEXT + ' ', ' ' + LAST_TEXT, LAST_TEXT + '\r\n']) {
+            assert.equal((await verifyAgyRetry(request({ version, expectedText }))).reason, 'reply-differs-from-events');
+        }
+    }
+});
+
 test('missing identity, unsupported versions and unavailable databases preserve failure', async () => {
     for (const extra of [
         { conversationId: '../escape' }, { conversationId: null }, { lastErrorStep: 3 },
-        { version: '1.4.2' }, { expectedText: '' }, { errorText: undefined },
+        { version: '1.4.0' }, { version: '1.4.3' }, { version: null }, { expectedText: '' }, { errorText: undefined },
         { directory: join(directory, 'does-not-exist') },
     ]) {
         assert.equal((await verifyAgyRetry(request(extra))).ok, false);

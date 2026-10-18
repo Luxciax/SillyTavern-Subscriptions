@@ -4,7 +4,7 @@ Status: implemented
 
 ## Problem
 
-An agy 1.4.1 session contains a filtered response (stop_reason 11), its safety
+Observed agy 1.4.1 and 1.4.2 sessions contain a filtered response (stop_reason 11), its safety
 error, and a later normal response (stop_reason 2). Its terminal result still
 reports the exact earlier error. Both responses have step status DONE, so DONE
 alone cannot prove success. The final response length is consistent with an
@@ -41,6 +41,14 @@ at the database boundary. Later errors, unfinished steps, response tool calls,
 new global failures and cancellation prevent recovery. Only the later normal
 response is emitted, including when SUCCESS carries an aggregate snapshot.
 Final SUCCESS already matching the last attempt needs no database exception.
+
+The explicit compatibility set is 1.4.1 and 1.4.2. Two observed 1.4.2 failures
+have the same schema and filter/error/normal-response ordering. A separate safe
+1.4.2 probe shows DONE emits one LF outside the persisted response. Exact event
+matching accepts that one suffix only, preserves the persisted response, and
+rejects additional whitespace or content differences. Removing the version
+boundary or trimming arbitrary whitespace would conceal unverified changes.
+Metadata-only verification traces include the detected CLI version.
 
 Unsupported CLI versions, runtimes lacking the tested read-only SQLite API
 (Node 22.13+ / 24+), unknown schemas and unavailable databases preserve failure.
@@ -83,9 +91,7 @@ The existing terminal-SUCCESS/hung-process regression remains covered.
 A read-only check of the original session selects its later normal reply.
 The file hash is unchanged. No saved chat is sent to a model for this check.
 
-The suite contains 224 tests. Of these, 222 pass and two skip.
-No test fails.
-The skipped YAML checks need an optional SillyTavern package.
-The installed extension stays at
-2f06b11 with a clean Git status and unchanged hashes for agy.js, chat.js and
-completion.js. No runtime activation or GitHub push is part of this delivery.
+Compatibility regressions cover both supported versions, DONE framing, genuine
+filtering, and future-version rejection. Real 1.4.2 session metadata and a safe
+CLI probe supply the format evidence; saved prompts are not replayed.
+Runtime activation and GitHub publication are separate from source validation.
