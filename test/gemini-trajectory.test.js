@@ -41,7 +41,7 @@ test('filtering, incomplete results, new errors, unknown schemas and other conve
 
 test('tested CLI versions accept the exact reply or one framing LF, without trimming mismatches', { skip: !hasSqlite }, async () => {
     writeFixture(directory);
-    for (const version of ['1.4.1', '1.4.2']) {
+    for (const version of ['1.4.1', '1.4.2', '1.4.10']) {
         for (const suffix of ['', '\n']) {
             const result = await verifyAgyRetry(request({ version, expectedText: LAST_TEXT + suffix }));
             assert.equal(result.ok, true);
@@ -56,7 +56,7 @@ test('tested CLI versions accept the exact reply or one framing LF, without trim
 test('missing identity, unsupported versions and unavailable databases preserve failure', async () => {
     for (const extra of [
         { conversationId: '../escape' }, { conversationId: null }, { lastErrorStep: 3 },
-        { version: '1.4.0' }, { version: '1.4.3' }, { version: null }, { expectedText: '' }, { errorText: undefined },
+        { version: '1.4.0' }, { version: '1.4.3' }, { version: '1.4.11' }, { version: null }, { expectedText: '' }, { errorText: undefined },
         { directory: join(directory, 'does-not-exist') },
     ]) {
         assert.equal((await verifyAgyRetry(request(extra))).ok, false);
@@ -88,10 +88,20 @@ test('cancelled recovery does not deliver a persisted response', { skip: !hasSql
 
 test('several filtered attempts can recover when the final error refers to the first one', { skip: !hasSqlite }, async () => {
     writeFixture(directory, { multipleRetries: true });
-    const result = await verifyAgyRetry(request({ lastTextStep: 5, lastErrorStep: 4 }));
+    const result = await verifyAgyRetry(request({ version: '1.4.10', lastTextStep: 5, lastErrorStep: 4 }));
     assert.equal(result.ok, true);
     assert.equal(result.errorStep, 2);
     assert.equal(result.response, LAST_TEXT);
+});
+
+test('1.4.10 rejects a filtered final retry and completed tool or unknown steps', { skip: !hasSqlite }, async () => {
+    writeFixture(directory, { multipleRetries: true, stopReason: 11 });
+    assert.equal((await verifyAgyRetry(request({ version: '1.4.10', lastTextStep: 5, lastErrorStep: 4 }))).reason, 'retry-not-normal');
+    for (const variant of [{ firstType: 15 }, { multipleRetries: true, intermediateType: 132 }, { multipleRetries: true, intermediateType: 999 }]) {
+        writeFixture(directory, variant);
+        const extra = variant.multipleRetries ? { lastTextStep: 5, lastErrorStep: 2 } : {};
+        assert.equal((await verifyAgyRetry(request({ version: '1.4.10', ...extra }))).reason, 'unexpected-trajectory-step');
+    }
 });
 
 test('missing optional SQLite support preserves the failure without installing a fallback', () => {

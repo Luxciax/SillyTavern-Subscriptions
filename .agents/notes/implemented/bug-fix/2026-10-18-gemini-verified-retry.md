@@ -4,7 +4,7 @@ Status: implemented
 
 ## Problem
 
-Observed agy 1.4.1 and 1.4.2 sessions contain a filtered response (stop_reason 11), its safety
+Observed agy 1.4.1, 1.4.2 and 1.4.10 sessions contain a filtered response (stop_reason 11), its safety
 error, and a later normal response (stop_reason 2). Its terminal result still
 reports the exact earlier error. Both responses have step status DONE, so DONE
 alone cannot prove success. The final response length is consistent with an
@@ -42,13 +42,24 @@ new global failures and cancellation prevent recovery. Only the later normal
 response is emitted, including when SUCCESS carries an aggregate snapshot.
 Final SUCCESS already matching the last attempt needs no database exception.
 
-The explicit compatibility set is 1.4.1 and 1.4.2. Two observed 1.4.2 failures
+The explicit compatibility set is 1.4.1, 1.4.2 and 1.4.10. Two observed 1.4.2 failures
 have the same schema and filter/error/normal-response ordering. A separate safe
 1.4.2 probe shows DONE emits one LF outside the persisted response. Exact event
 matching accepts that one suffix only, preserves the persisted response, and
 rejects additional whitespace or content differences. Removing the version
 boundary or trimming arbitrary whitespace would conceal unverified changes.
 Metadata-only verification traces include the detected CLI version.
+
+Read-only observations of three 1.4.10 failing conversations establish the same
+protobuf layout, complete response/error ordering, CONTENT_FILTER=11 and
+STOP_PATTERN=2. They include repeated filtering and later refusal text as well
+as later prose. A harmless live stream probe independently confirms ACTIVE/DONE,
+the framing LF and the terminal result shape. These observations establish the
+protocol, not the acceptability or success of a particular stored answer.
+Recovery continues to require the current request's event text and exact old
+error to match. An initial user-input step followed only by response/error steps
+is required; completed tools, additional input or unknown steps prevent recovery.
+Tool arguments and previously filtered drafts are never delivered as candidates.
 
 Unsupported CLI versions, runtimes lacking the tested read-only SQLite API
 (Node 22.13+ / 24+), unknown schemas and unavailable databases preserve failure.

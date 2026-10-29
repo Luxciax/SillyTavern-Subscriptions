@@ -39,8 +39,9 @@ this note addresses deployment drift and embedded tool instructions only. The
 superseded by those decisions. No conflicting proposed or rejected notes exist.
 
 Official main at 46fe9ce is already an ancestor of the fork. No additional merge
-or replacement of local fixes is needed. agy 1.4.10 is not added to the private
-SQLite retry compatibility set based solely on a normal successful probe.
+or replacement of local fixes is needed. agy 1.4.10 retry support requires the
+separate protocol evidence and regression cases described in
+[verified retry](2026-10-18-gemini-verified-retry.md), beyond a normal successful probe.
 
 ## Alternatives considered
 

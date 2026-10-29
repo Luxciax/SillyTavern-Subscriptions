@@ -234,6 +234,8 @@ const verifiedAgy = join(dir, 'agy-141.mjs');
 copyFileSync(fakeAgy, verifiedAgy);
 const verifiedAgy142 = join(dir, 'agy-142.mjs');
 copyFileSync(fakeAgy, verifiedAgy142);
+const verifiedAgy1410 = join(dir, 'agy-1410.mjs');
+copyFileSync(fakeAgy, verifiedAgy1410);
 const finalMarker = join(dir, 'final-marker');
 const dumpFile = join(dir, 'dump.json');
 const countFile = join(dir, 'count.txt');
@@ -539,9 +541,9 @@ test('runAgy: unverifiable retries and new global errors fail without emitting b
     }
 });
 
-test('runAgy: agy 1.4.2 DONE framing LF does not discard a verified retry', { skip: !hasSqlite }, async () => {
-    for (const scenario of ['verified-error', 'verified-aggregate', 'verified-blocked']) {
-        verifiedEnv(scenario, { FAKE_AGY_VERSION: '1.4.2', ST_SUBSCRIPTIONS_AGY_PATH: verifiedAgy142, FAKE_AGY_DONE_LF: '1' });
+test('runAgy: agy 1.4.2 and 1.4.10 DONE framing LF preserves only verified retries', { skip: !hasSqlite }, async () => {
+    for (const [version, path] of [['1.4.2', verifiedAgy142], ['1.4.10', verifiedAgy1410]]) for (const scenario of ['verified-error', 'verified-aggregate', 'verified-blocked']) {
+        verifiedEnv(scenario, { FAKE_AGY_VERSION: version, ST_SUBSCRIPTIONS_AGY_PATH: path, FAKE_AGY_DONE_LF: '1' });
         let emitted = '';
         const pending = runAgy({ prompt: 'p', model: 'm', onText: (d) => { emitted += d; return false; } });
         if (scenario === 'verified-blocked') {

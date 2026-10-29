@@ -32,6 +32,7 @@ export function writeFixture(directory, {
     id = ID, owner = id, beforeStopReason = 11, stopReason = 2, status = 3,
     text = LAST_TEXT, errorText = SAFETY_ERROR, laterError = false, laterPending = false,
     tools = false, badPayload = false, format = 0, multipleRetries = false,
+    firstType = 14, intermediateType = 17,
 } = {}) {
     mkdirSync(directory, { recursive: true });
     const path = join(directory, id + '.db');
@@ -54,14 +55,14 @@ export function writeFixture(directory, {
         `);
         db.prepare('INSERT INTO trajectory_meta VALUES (?,?)').run('synthetic-trajectory', owner);
         const insert = db.prepare('INSERT INTO steps VALUES (?,?,?,?,NULL,?)');
-        insert.run(0, 14, 3, 0, Buffer.concat([field(1, 14), field(4, 3)]));
+        insert.run(0, firstType, 3, 0, Buffer.concat([field(1, firstType), field(4, 3)]));
         insert.run(1, 15, 3, 0, replyPayload({ text: FIRST_TEXT, stopReason: beforeStopReason }));
         insert.run(2, 17, 3, 0, errorPayload(errorText));
         insert.run(3, 15, status, format, badPayload ? Buffer.from([0xff]) : replyPayload({ text, stopReason, status, tools }));
         if (multipleRetries) {
             db.prepare('UPDATE steps SET step_payload=? WHERE idx=3').run(replyPayload({ text: 'another rejected draft', stopReason: 11 }));
-            insert.run(4, 17, 3, 0, errorPayload(SAFETY_ERROR + ' (later attempt)'));
-            insert.run(5, 15, 3, 0, replyPayload());
+            insert.run(4, intermediateType, 3, 0, errorPayload(SAFETY_ERROR + ' (later attempt)'));
+            insert.run(5, 15, 3, 0, replyPayload({ text, stopReason }));
         }
         if (laterError) insert.run(4, 17, 3, 0, errorPayload('new terminal failure'));
         if (laterPending) insert.run(4, 15, 2, 0, replyPayload({ status: 2, text: 'unfinished' }));
