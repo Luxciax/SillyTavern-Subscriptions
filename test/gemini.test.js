@@ -392,6 +392,12 @@ test('AGY_ERROR parsing and status mapping', () => {
     assert.equal(parseAgyError(''), null);
 });
 
+test('lastUpstreamFailure parses current RESOURCE_EXHAUSTED and transport retry logs', () => {
+    const current = 'I x] Run: attempt 3 failed (RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).), retrying in 15s\n';
+    assert.deepEqual(lastUpstreamFailure(current), { attempt: 3, code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' });
+    const network = 'I x] Run: attempt 3 failed (stream reading error: unexpected EOF), retrying in 1s\n';
+    assert.deepEqual(lastUpstreamFailure(network), { attempt: 3, code: 502, message: 'stream reading error: unexpected EOF', status: 'NETWORK' });
+});
 test('agentLoadState reads agy\'s log lines', () => {
     assert.equal(agentLoadState('I x] Starting new conversation (agent=true)'), 'loaded');
     assert.equal(agentLoadState(`W x] Agent "${CHAT_AGENT_NAME}" not found, falling back to default`), 'fallback');
@@ -420,17 +426,15 @@ test('resolveGeminiModel: prefixes, effort variants, validation', () => {
     assert.equal(prefixed.apiModel, 'google/gemini-3.1-pro', 'the API id keeps the router prefix');
     assert.equal(resolveGeminiModel('models/gemini-3.8-flash-low').agyModel, 'gemini-3.8-flash-low');
     assert.equal(agyModelId('Google/models/gemini-x'), 'gemini-x');
-    // live catalog lists the variant → exact id
-    const swap = resolveGeminiModel('gemini-3.8-flash-high', 'low', live);
-    assert.deepEqual([swap.agyModel, swap.agyEffort, swap.effort], ['gemini-3.8-flash-low', undefined, 'low']);
-    // live catalog lacks it → 400 naming the real variants, no invented id
-    assert.throws(() => resolveGeminiModel('gemini-3.1-pro-high', 'medium', live), (err) => err.httpStatus === 400 && /high, low/.test(err.message));
-    // no live catalog → base id + agy's own --effort
-    const flag = resolveGeminiModel('gemini-3.1-pro-high', 'medium', { source: 'static', models: [] });
-    assert.deepEqual([flag.agyModel, flag.agyEffort], ['gemini-3.1-pro', 'medium']);
+    const suffixWins = resolveGeminiModel('gemini-3.8-flash-high', 'low', live);
+    assert.deepEqual([suffixWins.agyModel, suffixWins.agyEffort, suffixWins.effort], ['gemini-3.8-flash-high', undefined, 'high']);
+    const mediumWins = resolveGeminiModel('gemini-3.8-flash-medium', 'low', live);
+    assert.deepEqual([mediumWins.agyModel, mediumWins.agyEffort, mediumWins.effort], ['gemini-3.8-flash-medium', undefined, 'medium']);
+    assert.throws(() => resolveGeminiModel('gemini-3.1-pro', 'medium', live), (err) => err.httpStatus === 400 && /high, low/.test(err.message));
+    const flag = resolveGeminiModel('gemini-3.1-pro', 'medium', { source: 'static', models: [] });
+    assert.deepEqual([flag.agyModel, flag.agyEffort, flag.effort], ['gemini-3.1-pro', 'medium', 'medium']);
     const same = resolveGeminiModel('gemini-3.8-flash-high', 'high', live);
     assert.deepEqual([same.agyModel, same.agyEffort], ['gemini-3.8-flash-high', undefined]);
-    // unknown to the live catalog → let agy decide
     assert.deepEqual((({ agyModel, agyEffort }) => [agyModel, agyEffort])(resolveGeminiModel('gemini-9-ultra', 'low', live)), ['gemini-9-ultra', 'low']);
     for (const bad of ['gemini-x&echo INJECTED', 'gemini x', 'google/', '-gemini', 'gemini/../x']) {
         assert.throws(() => resolveGeminiModel(bad), (err) => err.httpStatus === 400, bad);
@@ -840,14 +844,13 @@ test('runAgy: a fallback the log only shows later still stops the turn before an
     assert.equal(text, '');
 });
 
-test('runAgy: persistent rate limiting ends the turn with a 429 instead of waiting out the watchdog', async () => {
+test('runAgy: persistent rate limiting remains owned by agy and the watchdog preserves HTTP 429', async () => {
     resetEnv({ FAKE_AGY_SCENARIO: 'ratelimit' });
     const t0 = Date.now();
-    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText }), (err) => err.httpStatus === 429 && /rate limiting/.test(err.message) && !err.refusal);
+    await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText, firstOutputMs: 400 }),
+        (err) => err.httpStatus === 429 && /HTTP 429 RESOURCE_EXHAUSTED/.test(err.message) && !err.refusal);
     assert.ok(Date.now() - t0 < 5000);
     assert.ok(await waitGone(dump().pid));
-
-    // other upstream errors: the watchdog reports the last one and its status
     resetEnv({ FAKE_AGY_SCENARIO: 'unavailable' });
     await assert.rejects(runAgy({ prompt: 'p', model: 'm', onText: noText, firstOutputMs: 400 }), (err) => err.httpStatus === 503 && /HTTP 503 UNAVAILABLE/.test(err.message));
     assert.ok(await waitGone(dump().pid));
@@ -1051,6 +1054,40 @@ test('runGeminiChat partitions >192 KB roleplay chats across agent.md and STDIN 
     assert.ok(await waitGone(d.pid));
     for (let i = 0; i < 40 && existsSync(agentDir); i++) await new Promise((r) => setTimeout(r, 50));
     assert.equal(existsSync(agentDir), false, 'the per-run agent directory is removed during process cleanup');
+});
+
+test('foldConversationForAgy never promotes in-chat system segments into agent.md', () => {
+    const oldUser = 'OLD_USER_START ' + 'ordinary old user context '.repeat(220) + ' OLD_USER_END';
+    const inChatSystem = 'INCHAT_SYSTEM_START ' + 'late system/world-info instruction '.repeat(360) + ' INCHAT_SYSTEM_TAIL';
+    const messages = [
+        { role: 'user', content: oldUser },
+        { role: 'system', content: inChatSystem },
+        { role: 'assistant', content: 'ASSISTANT_RECENT ' + 'recent reply '.repeat(80) },
+        { role: 'user', content: 'CURRENT_USER_SENTINEL' },
+    ];
+    const folded = foldConversationForAgy(messages, { maxStdinBytes: 9000, maxTotalBytes: 40000 });
+    const agent = folded.agentSections.map((x) => x.content).join(String.fromCharCode(10));
+    assert.ok(Buffer.byteLength(folded.prompt, 'utf8') <= 9000);
+    assert.equal(agent.includes('INCHAT_SYSTEM_'), false, 'post-history system text must never be raised into agent systemInstruction');
+    assert.equal(folded.prompt.includes('INCHAT_SYSTEM_TAIL'), true, 'the newest tail of an oversized in-chat system segment stays on STDIN');
+    assert.equal(folded.prompt.includes('CURRENT_USER_SENTINEL'), true, 'the current user turn remains on STDIN');
+    assert.ok(folded.splitHistoryParts >= 1, 'the oversized mixed history unit is split at the STDIN boundary');
+    assert.ok(folded.droppedInChatSystemParts >= 1, 'only the older prefix of the in-chat system segment is omitted');
+});
+
+test('foldConversationForAgy keeps mixed post-history instructions with the current user instead of agent.md', () => {
+    const messages = [
+        { role: 'user', content: 'OLD_CONTEXT ' + 'old dialogue '.repeat(120) },
+        { role: 'assistant', content: 'OLD_REPLY' },
+        { role: 'system', content: 'POST_HISTORY_RULE_SENTINEL keep the requested output format.' },
+        { role: 'user', content: 'LATEST_USER_SENTINEL continue the scene.' },
+    ];
+    const folded = foldConversationForAgy(messages, { maxStdinBytes: 5000, maxTotalBytes: 20000 });
+    const agent = folded.agentSections.map((x) => x.content).join(String.fromCharCode(10));
+    assert.equal(agent.includes('POST_HISTORY_RULE_SENTINEL'), false);
+    assert.equal(folded.prompt.includes('<post_history_instructions>'), true);
+    assert.equal(folded.prompt.includes('POST_HISTORY_RULE_SENTINEL'), true);
+    assert.equal(folded.prompt.includes('User: LATEST_USER_SENTINEL'), true);
 });
 
 test('foldConversationForAgy trims oldest history turns when a mega-conversation exceeds AGY_MAX_TOTAL_BYTES', () => {
