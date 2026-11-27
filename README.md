@@ -23,7 +23,7 @@ shows up, the rest stay out of the way.
 1. Server plugin, from your SillyTavern folder (the one with `server.js`):
 
    ```bash
-   node plugins.js install https://github.com/LukaTheHero/SillyTavern-Subscriptions
+   node plugins.js install https://github.com/Luxciax/SillyTavern-Subscriptions
    cd plugins/SillyTavern-Subscriptions
    npm install
    ```
